@@ -1,5 +1,6 @@
 pandas
 numpy
+datasets
 sentence-transformers
 faiss-cpu
 langchain
