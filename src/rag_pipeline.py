@@ -1,6 +1,9 @@
 """
 Reusable components for the Wikipedia RAG pipeline: data loading,
 chunking, and vector indexing. More to come (retrieval eval, generation).
+
+Pinned numpy<2 in requirements.txt — sentence-transformers/torch on this
+machine segfaulted against numpy 2.x.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ def load_qa(path: str = "data/qa_test.parquet") -> pd.DataFrame:
 
 def passages_to_documents(df: pd.DataFrame) -> list[Document]:
     return [
-        Document(page_content=row.passage, metadata={"passage_id": row.id})
+        Document(page_content=row.passage, metadata={"passage_id": int(row.Index)})
         for row in df.itertuples()
     ]
 
