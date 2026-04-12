@@ -47,3 +47,33 @@ def build_vector_store(
 ) -> FAISS:
     embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
     return FAISS.from_documents(documents, embeddings)
+
+
+def evaluate_retrieval(
+    vector_store: FAISS,
+    qa_df: pd.DataFrame,
+    k: int = 4,
+    sample_size: int = 150,
+    seed: int = 42,
+) -> tuple[float, pd.DataFrame]:
+    """For each sampled question, does ANY of the top-k retrieved chunks
+    actually contain the gold answer text? This is what silently fails
+    when chunking/embeddings are bad.
+
+    Yes/no answers are excluded: checking whether "yes" appears in a
+    retrieved chunk is close to meaningless, so they'd inflate the hit
+    rate without saying anything about retrieval quality.
+    """
+    non_yes_no = qa_df[~qa_df["answer"].str.lower().str.strip(".").isin({"yes", "no"})]
+    sample = non_yes_no.sample(n=min(sample_size, len(non_yes_no)), random_state=seed)
+
+    rows = []
+    for row in sample.itertuples():
+        docs = vector_store.similarity_search(row.question, k=k)
+        answer_lower = str(row.answer).lower()
+        hit = any(answer_lower in doc.page_content.lower() for doc in docs)
+        rows.append({"question": row.question, "answer": row.answer, "hit": hit})
+
+    results = pd.DataFrame(rows)
+    hit_rate = results["hit"].mean()
+    return hit_rate, results

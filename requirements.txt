@@ -1,5 +1,6 @@
 pandas
 numpy<2
+plotly
 datasets
 sentence-transformers
 faiss-cpu
