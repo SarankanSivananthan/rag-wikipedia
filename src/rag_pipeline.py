@@ -77,3 +77,43 @@ def evaluate_retrieval(
     results = pd.DataFrame(rows)
     hit_rate = results["hit"].mean()
     return hit_rate, results
+
+
+def get_llm(provider: str = "local", model_name: str | None = None):
+    """Generation backend. Only a local Hugging Face model for now."""
+    if provider == "local":
+        from transformers import pipeline
+        from langchain_huggingface import HuggingFacePipeline
+
+        pipe = pipeline(
+            "text2text-generation",
+            model=model_name or "google/flan-t5-base",
+            max_new_tokens=200,
+        )
+        return HuggingFacePipeline(pipeline=pipe)
+
+    raise ValueError(f"Unknown provider: {provider!r} (expected local)")
+
+
+RAG_PROMPT = """Answer the question using only the context below. \
+If the context doesn't contain the answer, say "I don't know" — do not guess.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+
+def answer_question(vector_store: FAISS, llm, question: str, k: int = 4):
+    """Retrieve top-k chunks and generate an answer grounded in them.
+    Returns (answer, source_documents) so the sources can be shown.
+    """
+    docs = vector_store.similarity_search(question, k=k)
+    context = "\n\n".join(doc.page_content for doc in docs)
+    prompt = RAG_PROMPT.format(context=context, question=question)
+    answer = llm.invoke(prompt)
+    if hasattr(answer, "content"):  # chat models return a message object
+        answer = answer.content
+    return answer, docs

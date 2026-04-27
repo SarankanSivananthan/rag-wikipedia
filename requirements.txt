@@ -7,5 +7,7 @@ faiss-cpu
 langchain
 langchain-community
 langchain-huggingface
+transformers
+accelerate
 jupyter
 ipykernel
