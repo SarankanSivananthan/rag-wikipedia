@@ -1,9 +1,10 @@
 """
-Reusable components for the Wikipedia RAG pipeline: data loading,
-chunking, and vector indexing. More to come (retrieval eval, generation).
+Reusable components for the Wikipedia RAG pipeline: data loading, chunking,
+vector indexing, retrieval, generation, and a simple retrieval-relevance
+evaluation.
 
-Pinned numpy<2 in requirements.txt — sentence-transformers/torch on this
-machine segfaulted against numpy 2.x.
+Kept as plain functions (rather than a framework-y class hierarchy) so the
+notebook can call each step individually and inspect intermediate results.
 """
 from __future__ import annotations
 
@@ -36,6 +37,10 @@ def passages_to_documents(df: pd.DataFrame) -> list[Document]:
 def chunk_documents(
     documents: list[Document], chunk_size: int = 500, chunk_overlap: int = 50
 ) -> list[Document]:
+    """Re-chunk the (already passage-sized) corpus at a configurable
+    granularity, so chunk size/overlap can be compared like a real corpus
+    that wasn't pre-split by the dataset authors.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
@@ -49,38 +54,17 @@ def build_vector_store(
     return FAISS.from_documents(documents, embeddings)
 
 
-def evaluate_retrieval(
-    vector_store: FAISS,
-    qa_df: pd.DataFrame,
-    k: int = 4,
-    sample_size: int = 150,
-    seed: int = 42,
-) -> tuple[float, pd.DataFrame]:
-    """For each sampled question, does ANY of the top-k retrieved chunks
-    actually contain the gold answer text? This is what silently fails
-    when chunking/embeddings are bad.
-
-    Yes/no answers are excluded: checking whether "yes" appears in a
-    retrieved chunk is close to meaningless, so they'd inflate the hit
-    rate without saying anything about retrieval quality.
-    """
-    non_yes_no = qa_df[~qa_df["answer"].str.lower().str.strip(".").isin({"yes", "no"})]
-    sample = non_yes_no.sample(n=min(sample_size, len(non_yes_no)), random_state=seed)
-
-    rows = []
-    for row in sample.itertuples():
-        docs = vector_store.similarity_search(row.question, k=k)
-        answer_lower = str(row.answer).lower()
-        hit = any(answer_lower in doc.page_content.lower() for doc in docs)
-        rows.append({"question": row.question, "answer": row.answer, "hit": hit})
-
-    results = pd.DataFrame(rows)
-    hit_rate = results["hit"].mean()
-    return hit_rate, results
-
-
 def get_llm(provider: str = "local", model_name: str | None = None):
-    """Generation backend. Only a local Hugging Face model for now."""
+    """Pluggable generation backend.
+
+    - "local": a small Hugging Face seq2seq model running in-process — no
+      account, no server, works out of the box. Used as the default so the
+      pipeline is runnable without any external setup.
+    - "ollama": a locally-served model (e.g. Mistral, Llama) via Ollama.
+      Requires Ollama installed and the model pulled (`ollama pull mistral`).
+    - "openai": a hosted model via the OpenAI API. Requires
+      `OPENAI_API_KEY` set in the environment.
+    """
     if provider == "local":
         from transformers import pipeline
         from langchain_huggingface import HuggingFacePipeline
@@ -92,7 +76,17 @@ def get_llm(provider: str = "local", model_name: str | None = None):
         )
         return HuggingFacePipeline(pipeline=pipe)
 
-    raise ValueError(f"Unknown provider: {provider!r} (expected local)")
+    if provider == "ollama":
+        from langchain_ollama import OllamaLLM
+
+        return OllamaLLM(model=model_name or "mistral")
+
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(model=model_name or "gpt-4o-mini", temperature=0)
+
+    raise ValueError(f"Unknown provider: {provider!r} (expected local/ollama/openai)")
 
 
 RAG_PROMPT = """Answer the question using only the context below. \
@@ -117,3 +111,35 @@ def answer_question(vector_store: FAISS, llm, question: str, k: int = 4):
     if hasattr(answer, "content"):  # chat models return a message object
         answer = answer.content
     return answer, docs
+
+
+def evaluate_retrieval(
+    vector_store: FAISS,
+    qa_df: pd.DataFrame,
+    k: int = 4,
+    sample_size: int = 150,
+    seed: int = 42,
+) -> tuple[float, pd.DataFrame]:
+    """A simple but real relevance check: for each sampled question, does
+    ANY of the top-k retrieved chunks actually contain the gold answer
+    text? This is what silently fails when chunking/embeddings are bad —
+    the LLM then generates a plausible-sounding but ungrounded answer.
+
+    Yes/no answers are excluded: checking whether "yes" appears in a
+    retrieved chunk is close to meaningless (it's a near-universal word),
+    so they'd inflate the hit rate without saying anything about retrieval
+    quality.
+    """
+    non_yes_no = qa_df[~qa_df["answer"].str.lower().str.strip(".").isin({"yes", "no"})]
+    sample = non_yes_no.sample(n=min(sample_size, len(non_yes_no)), random_state=seed)
+
+    rows = []
+    for row in sample.itertuples():
+        docs = vector_store.similarity_search(row.question, k=k)
+        answer_lower = str(row.answer).lower()
+        hit = any(answer_lower in doc.page_content.lower() for doc in docs)
+        rows.append({"question": row.question, "answer": row.answer, "hit": hit})
+
+    results = pd.DataFrame(rows)
+    hit_rate = results["hit"].mean()
+    return hit_rate, results
