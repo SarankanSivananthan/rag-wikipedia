@@ -37,11 +37,12 @@ from rag_pipeline import (
     answer_question,
     build_vector_store,
     chunk_documents,
-    evaluate_retrieval,
+    evaluate_retrieval_at_k,
     get_llm,
     load_corpus,
     load_qa,
     passages_to_documents,
+    scorable_questions,
 )
 """)
 
@@ -61,13 +62,18 @@ qa_df.head(5)
 md("""\
 Nearly half the gold answers are just "yes"/"no" — fine for the dataset's
 original QA-accuracy purpose, but useless for evaluating *retrieval*
-(checking whether "yes" appears in a retrieved chunk says nothing). The
-evaluation step later filters these out.
+(checking whether "yes" appears in a retrieved chunk says nothing, and the
+dataset has no gold passage ids to check against instead). Answers that
+*start* with yes/no ("No, it contributed 1.56% to GDP in 2001.") are
+excluded too: the full sentence can never appear verbatim in a chunk. The
+retrieval evaluation below runs on **every remaining question — no
+sampling**.
 """)
 
 code("""\
 print(qa_df["answer"].str.lower().str.strip(".").value_counts().head(5))
-print(f"\\n{(qa_df['answer'].str.lower().str.strip('.').isin(['yes', 'no'])).mean():.0%} of answers are yes/no")
+scored = scorable_questions(qa_df)
+print(f"\\n{len(qa_df)} questions -> {len(qa_df) - len(scored)} yes/no-style excluded, {len(scored)} scorable")
 """)
 
 md("""\
@@ -84,47 +90,63 @@ documents = passages_to_documents(corpus_df)
 print(f"{len(documents)} source documents")
 """)
 
-code("""\
-configs = [(100, 0), (250, 25), (500, 50), (1000, 100)]
-chunking_results = []
-
-for chunk_size, overlap in configs:
-    chunks = chunk_documents(documents, chunk_size=chunk_size, chunk_overlap=overlap)
-    t0 = time.time()
-    vs = build_vector_store(chunks)
-    build_time = time.time() - t0
-    hit_rate, _ = evaluate_retrieval(vs, qa_df, k=4, sample_size=150)
-    chunking_results.append({
-        "chunk_size": chunk_size, "overlap": overlap,
-        "n_chunks": len(chunks), "hit_rate": hit_rate, "build_time_s": build_time,
-    })
-    print(f"chunk_size={chunk_size:>5} overlap={overlap:>4}: {len(chunks):>5} chunks, "
-          f"hit_rate={hit_rate:.1%}, build_time={build_time:.0f}s")
-
-chunking_df = pd.DataFrame(chunking_results)
+md("""\
+The sweep itself (4 chunk sizes x 498 questions, one FAISS index per chunk
+size, ~6 minutes on CPU) lives in `src/eval_retrieval.py` and writes
+`results/retrieval_hit_at_k.csv`; this notebook loads its output instead
+of re-running it. For each question the top 8 chunks are retrieved once,
+so hit@1/2/4/8 all come from the same retrieval. **hit@k = the share of
+questions where at least one of the top-k chunks contains the gold answer
+text.**
 """)
 
 code("""\
-fig = px.bar(
-    chunking_df, x="chunk_size", y="hit_rate", text="n_chunks",
-    labels={"chunk_size": "Chunk size (characters)", "hit_rate": "Retrieval hit rate @k=4"},
-    title="Retrieval quality by chunk size (label = number of resulting chunks)",
+hit_df = pd.read_csv("../results/retrieval_hit_at_k.csv")
+ks = [1, 2, 4, 8]
+all_q = hit_df[hit_df["subset"] == "all"]
+all_q[["chunk_size", "overlap", "n_chunks"] + [f"hit@{k}" for k in ks]].style.format(
+    {"n_chunks": "{:,}", **{f"hit@{k}": "{:.1%}" for k in ks}}
+).hide(axis="index")
+""")
+
+code("""\
+long = pd.concat([
+    all_q.assign(k=k, hit=all_q[f"hit@{k}"], ci=all_q[f"ci95@{k}"])[["chunk_size", "k", "hit", "ci"]]
+    for k in ks
+])
+long["chunk_size"] = long["chunk_size"].astype(str)
+fig = px.line(
+    long, x="k", y="hit", color="chunk_size", error_y="ci", markers=True,
+    labels={"k": "k (chunks retrieved)", "hit": "hit@k", "chunk_size": "Chunk size (chars)"},
+    title="Retrieval hit@k by chunk size — all 498 scorable questions (bars = 95% Wilson CI)",
 )
-fig.update_traces(texttemplate="%{text} chunks", textposition="outside")
 fig.update_layout(yaxis_tickformat=".0%")
+fig.update_xaxes(tickvals=ks)
 fig.show()
 """)
 
 md("""\
-**Chunk size 100 is a clear loser** (25% hit rate vs. ~42-44% for larger
-sizes) — chunks that small routinely split a fact away from the context
-that would make it retrievable. Sizes 250-1000 are roughly comparable
-here (a side effect of this dataset's passages already being fairly
-short and self-contained); **250** edges out the others slightly and is
-used for the rest of this notebook. On a real, less pre-cleaned corpus
-this gap would likely be more pronounced — which is exactly the kind of
-silent failure mode that motivates measuring retrieval instead of
-assuming it works.
+Three things the full evaluation shows:
+
+- **100-character chunks are clearly worse**: 31.5% hit@4 vs. 46-48% for
+  larger sizes, a ~15-16 point gap against 95% intervals of about ±4 points.
+  That holds on the subset of answers short enough to fit inside every
+  chunk size (33% vs. 47-49%, `results/retrieval_hit_at_k.md`), so it is
+  not an artifact of chunks too small to ever contain a long answer.
+- **250, 500 and 1000 characters are statistically indistinguishable**
+  (hit@4: 46.6%, 46.4%, 47.8% — all well inside each other's intervals).
+  An earlier 150-question sample suggested 250 "edged out" the others;
+  that was sampling noise, and on the full set 1000 is nominally ahead at
+  every k. The honest conclusion is "somewhere between 250 and 1000 is
+  fine on this corpus," not a winner.
+- **More chunks help, with diminishing returns**: going from k=4 to k=8
+  adds 3-6 points, while k=1 to k=4 adds 14-16 points for 250-1000
+  characters (9 for 100) — at the cost of a longer prompt for the generator.
+
+**250/25 is used for the rest of this notebook** — not because it
+retrieves best (it doesn't, measurably), but because it retrieves about
+as well as the others while keeping the 4-chunk prompt short for the small
+local model.
 """)
 
 code("""\
@@ -151,34 +173,35 @@ print("Saved to ../data/faiss_index")
 """)
 
 md("""\
-## 4. Retrieval evaluation
+## 4. Retrieval evaluation on the chosen index
 
 Before trusting any generated answer, we check something more basic:
-**does retrieval even surface the right information?** For a sample of
-questions (excluding yes/no answers, per the note in section 1), we
-check whether the gold answer text appears in *any* of the top-k
-retrieved chunks.
+**does retrieval even surface the right information?** Re-running the
+full evaluation on the 250-character index built above (all 498 scorable
+questions, no sampling) should reproduce the 250 row of the table in
+section 2:
 """)
 
 code("""\
-hit_rate, eval_results = evaluate_retrieval(vector_store, qa_df, k=4, sample_size=150)
-print(f"Retrieval hit rate @k=4: {hit_rate:.1%}")
-eval_results.head(10)
+eval_results = evaluate_retrieval_at_k(vector_store, qa_df, max_k=8)
+print(f"{len(eval_results)} questions evaluated")
+for k in ks:
+    print(f"hit@{k}: {(eval_results['first_hit_rank'] <= k).mean():.1%}")
 """)
 
 md("""\
-~44% is an honest, unglamorous number — and a realistic one for exact
-substring matching against Wikipedia trivia (a correct answer can be
-retrieved yet phrased differently than the dataset's gold string, which
-this simple check would count as a miss). It's a deliberately strict
-lower bound, not a final verdict: good enough to flag *when retrieval
-quality changes* (e.g. across chunk sizes, embedding models), which is
-its actual purpose here.
+~47% hit@4 is an honest, unglamorous number — and a deliberately strict
+one. The check is exact substring matching of the gold answer, so a
+correct passage that phrases the answer differently counts as a miss, and
+this metric cannot tell those apart from genuine retrieval failures. That
+makes it a lower bound, not a final verdict: good enough to flag *when
+retrieval quality changes* (across chunk sizes, embedding models, k),
+which is its actual purpose here.
 """)
 
 code("""\
-print("Examples where retrieval MISSED the answer:")
-eval_results[~eval_results["hit"]].head(5)
+print("Examples where none of the top-8 chunks contained the gold answer:")
+eval_results[eval_results["first_hit_rank"].isna()][["question", "answer"]].head(5)
 """)
 
 md("""\
@@ -236,13 +259,16 @@ than one anecdote at a time.
 md("""\
 ## 6. Takeaways
 
-- **Chunk size has a real, measurable effect on retrieval** — 100-character
-  chunks retrieve the right context 25% of the time vs. ~42-44% for
-  250-1000 characters. Not a detail to skip.
+- **Chunk size has a real, measurable effect on retrieval — up to a
+  point.** 100-character chunks hit the right context 31.5% of the time
+  (hit@4, all 498 scorable questions) vs. 46-48% for 250-1000 characters;
+  within 250-1000 the differences are inside the noise. Measured on the
+  full question set, not a sample — the earlier 150-question sample had
+  produced a spurious "250 wins."
 - **Retrieval quality should be measured, not assumed.** A generation
   step has no way to know its context is wrong — it will produce a
   fluent, confident, incorrect answer just as readily as a correct one.
-  The `evaluate_retrieval` hit-rate check exists specifically to catch
+  The hit@k check (`evaluate_retrieval_at_k`) exists specifically to catch
   this before it reaches a user.
 - **Grounding the prompt with an explicit "I don't know" escape hatch**
   turns a retrieval failure into a visible non-answer instead of a

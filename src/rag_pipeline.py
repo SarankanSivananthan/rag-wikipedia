@@ -113,25 +113,72 @@ def answer_question(vector_store: FAISS, llm, question: str, k: int = 4):
     return answer, docs
 
 
+def scorable_questions(qa_df: pd.DataFrame) -> pd.DataFrame:
+    """Questions whose gold answer can be checked by substring match.
+
+    Yes/no-style answers ("yes", "No, it contributed 1.56% to GDP in 2001.")
+    are excluded: looking for "yes" in a retrieved chunk is close to
+    meaningless (the dataset has no gold passage ids to check against
+    instead), and the longer ones can never appear verbatim in a chunk.
+    Either way they would distort the hit rate without saying anything
+    about retrieval quality. On the 918 questions this leaves 498.
+    """
+    answers = qa_df["answer"].astype(str).str.lower().str.strip().str.strip(".")
+    return qa_df[~answers.str.match(r"^(yes|no)\b")]
+
+
+def evaluate_retrieval_at_k(
+    vector_store: FAISS, qa_df: pd.DataFrame, max_k: int = 8
+) -> pd.DataFrame:
+    """Full (non-sampled) retrieval evaluation over every scorable question.
+
+    Retrieves the top `max_k` chunks once per question and records the
+    1-based rank of the first chunk containing the gold answer text
+    (NaN = not in the top max_k). hit@k for any k <= max_k is then simply
+    `first_hit_rank <= k`, so every k comes from the same retrieval.
+    """
+    scored = scorable_questions(qa_df)
+    # Queries are embedded in one batch and searched by vector — identical
+    # to similarity_search(), without re-loading the model per question.
+    vectors = vector_store.embeddings.embed_documents(scored["question"].tolist())
+
+    rows = []
+    for row, vec in zip(scored.itertuples(), vectors):
+        docs = vector_store.similarity_search_by_vector(vec, k=max_k)
+        answer_lower = str(row.answer).lower()
+        rank = next(
+            (i + 1 for i, doc in enumerate(docs) if answer_lower in doc.page_content.lower()),
+            None,
+        )
+        rows.append({
+            "question": row.question,
+            "answer": row.answer,
+            "answer_len": len(str(row.answer)),
+            "first_hit_rank": rank,
+        })
+    return pd.DataFrame(rows)
+
+
 def evaluate_retrieval(
     vector_store: FAISS,
     qa_df: pd.DataFrame,
     k: int = 4,
-    sample_size: int = 150,
+    sample_size: int | None = 150,
     seed: int = 42,
 ) -> tuple[float, pd.DataFrame]:
-    """A simple but real relevance check: for each sampled question, does
-    ANY of the top-k retrieved chunks actually contain the gold answer
-    text? This is what silently fails when chunking/embeddings are bad —
-    the LLM then generates a plausible-sounding but ungrounded answer.
-
-    Yes/no answers are excluded: checking whether "yes" appears in a
-    retrieved chunk is close to meaningless (it's a near-universal word),
-    so they'd inflate the hit rate without saying anything about retrieval
-    quality.
+    """A simple but real relevance check: for each (optionally sampled)
+    question, does ANY of the top-k retrieved chunks actually contain the
+    gold answer text? This is what silently fails when chunking/embeddings
+    are bad — the LLM then generates a plausible-sounding but ungrounded
+    answer. `sample_size=None` evaluates every scorable question; see
+    `evaluate_retrieval_at_k` for the full, multi-k version.
     """
-    non_yes_no = qa_df[~qa_df["answer"].str.lower().str.strip(".").isin({"yes", "no"})]
-    sample = non_yes_no.sample(n=min(sample_size, len(non_yes_no)), random_state=seed)
+    non_yes_no = scorable_questions(qa_df)
+    sample = (
+        non_yes_no
+        if sample_size is None
+        else non_yes_no.sample(n=min(sample_size, len(non_yes_no)), random_state=seed)
+    )
 
     rows = []
     for row in sample.itertuples():
