@@ -100,17 +100,41 @@ Question: {question}
 Answer:"""
 
 
+CLOSED_BOOK_PROMPT = """Answer the question as briefly as possible.
+
+Question: {question}
+
+Answer:"""
+
+
+def build_rag_prompt(docs: list[Document], question: str) -> str:
+    context = "\n\n".join(doc.page_content for doc in docs)
+    return RAG_PROMPT.format(context=context, question=question)
+
+
 def answer_question(vector_store: FAISS, llm, question: str, k: int = 4):
     """Retrieve top-k chunks and generate an answer grounded in them.
     Returns (answer, source_documents) so the sources can be shown.
     """
     docs = vector_store.similarity_search(question, k=k)
-    context = "\n\n".join(doc.page_content for doc in docs)
-    prompt = RAG_PROMPT.format(context=context, question=question)
-    answer = llm.invoke(prompt)
+    answer = llm.invoke(build_rag_prompt(docs, question))
     if hasattr(answer, "content"):  # chat models return a message object
         answer = answer.content
     return answer, docs
+
+
+def generate_answers(llm, prompts: list[str]) -> list[str]:
+    """Run many prompts through any backend from `get_llm()`.
+
+    Text-completion LLMs (the local Hugging Face pipeline, Ollama) go
+    through `generate()`, which batches internally; chat models (OpenAI)
+    go through `batch()` and return message objects.
+    """
+    from langchain_core.language_models.llms import BaseLLM
+
+    if isinstance(llm, BaseLLM):
+        return [gen[0].text for gen in llm.generate(prompts).generations]
+    return [msg.content for msg in llm.batch(prompts)]
 
 
 def scorable_questions(qa_df: pd.DataFrame) -> pd.DataFrame:
