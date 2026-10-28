@@ -44,6 +44,7 @@ from rag_pipeline import (
     passages_to_documents,
     scorable_questions,
 )
+from qa_metrics import is_abstention
 """)
 
 md("## 1. Load the data")
@@ -257,7 +258,142 @@ than one anecdote at a time.
 """)
 
 md("""\
-## 6. Takeaways
+## 6. Generation evaluation on all 918 Q&A
+
+Retrieval hit@k says whether the right text reached the model, not whether
+the model *answered correctly*. `src/eval_generation.py` (~1h30 on CPU) runs
+three systems on **all 918 questions** and scores their answers against the
+gold answers with SQuAD-style **exact match** (EM) and **token F1**
+(`src/qa_metrics.py`; lowercase, punctuation and articles stripped). Its
+output is committed in `results/` and loaded here:
+
+- **Always "yes"** — a trivial baseline, because 36% of the gold answers are literally "yes"
+- **Closed-book** — the same `flan-t5-base` with the question only, no retrieval
+- **RAG** — 250-character chunks, top-4, the pipeline from section 5
+
+"I don't know" counts as a wrong answer for EM and F1; its rate is reported
+separately. Intervals are 95% bootstrap intervals.
+""")
+
+code("""\
+gen_metrics = pd.read_csv("../results/generation_metrics.csv")
+gen_preds = pd.read_csv("../results/generation_predictions.csv")
+
+def with_ci(value, lo, hi):
+    return value.map("{:.1%}".format) + " (" + lo.map("{:.1%}".format) + "–" + hi.map("{:.1%}".format) + ")"
+
+gen_metrics.assign(
+    EM=with_ci(gen_metrics["em"], gen_metrics["em_lo"], gen_metrics["em_hi"]),
+    F1=with_ci(gen_metrics["f1"], gen_metrics["f1_lo"], gen_metrics["f1_hi"]),
+    idk=gen_metrics["abstain_rate"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}"),
+)[["subset", "system", "EM", "F1", "idk"]].rename(columns={"idk": "answered I don't know"})
+""")
+
+md("""\
+**Read the overall row with care.** Over all 918 questions RAG scores 35.9%
+EM — statistically the same as the 36.3% of answering "yes" to everything,
+because 46% of the dataset is yes/no questions and 81% of those are "yes".
+(On F1 RAG is ahead: 44.6% vs. 36.6%, with non-overlapping intervals.)
+The overall number mostly measures the dataset's answer mix, so the two
+slices below are the ones that say something about the system.
+
+**Open questions (498): this is where retrieval earns its keep.** Same
+model, same questions: RAG reaches 31.5% EM / 47.2% F1, closed-book 1.8% /
+8.1%. Without retrieved context `flan-t5-base` almost never knows the
+answer.
+""")
+
+code("""\
+open_q = gen_preds[gen_preds["question_type"] == "open"]
+by_retrieval = open_q.groupby("retrieval_hit").agg(
+    questions=("question", "size"), exact_match=("rag_em", "mean"),
+    f1=("rag_f1", "mean"), answered_idk=("rag_abstained", "mean"),
+)
+by_retrieval.index = by_retrieval.index.map({True: "gold answer in top-4", False: "gold answer NOT in top-4"})
+by_retrieval.style.format({"exact_match": "{:.1%}", "f1": "{:.1%}", "answered_idk": "{:.1%}"})
+""")
+
+code("""\
+missed = open_q[open_q["retrieval_hit"] == False]
+answered_anyway = missed[~missed["rag_abstained"]]
+no_overlap = answered_anyway[answered_anyway["rag_f1"] == 0]
+print(f"Retrieval missed on {len(missed)} open questions; RAG still answered {len(answered_anyway)} of them,")
+print(f"and {len(no_overlap)} of those answers share no word with the gold answer. Examples:\\n")
+no_overlap[["question", "gold", "rag_pred"]].head(6)
+""")
+
+md("""\
+**Generation is bounded by retrieval.** When the gold answer is in the
+top-4, RAG gets 71.2% F1 (56.9% EM); when it is not, 26.3% F1 (9.4% EM).
+The "I don't know" instruction does react to bad context — it fires 27.8%
+of the time on retrieval misses vs. 8.2% on hits — but it is far from a
+guarantee: on 192 of the 266 misses the model answered anyway, and 65
+of those answers (e.g. "When was Coolidge born?" → "1906") have no word in
+common with the gold answer. A few of the zero-overlap cases are the metric
+being strict rather than the model being wrong (the gold answer for
+Coolidge's state is the typo `MassachuS08_setts`; "23-year" does not match
+"23 years"), so EM and F1 here are conservative.
+
+**Yes/no questions (420): the weak spot.** RAG scores 41.2% EM against
+79.3% for always saying "yes". Where the answers went:
+""")
+
+code("""\
+yn = gen_preds[gen_preds["question_type"] == "yes/no"].copy()
+
+def answer_kind(prediction):
+    if is_abstention(prediction):
+        return "I don't know"
+    words = str(prediction).lower().strip().lstrip("\\"' ").split()
+    first = words[0].strip(".,!?") if words else ""
+    return first if first in ("yes", "no") else "something else"
+
+yn["rag_answer"] = yn["rag_pred"].map(answer_kind)
+yn["gold_answer"] = yn["gold"].map(lambda g: "yes" if str(g).lower().strip().startswith("yes") else "no")
+print(pd.crosstab(yn["gold_answer"], yn["rag_answer"], margins=True, rownames=["gold"], colnames=["RAG answered"]))
+
+committed = yn[yn["rag_answer"].isin(["yes", "no"])]
+right = (committed["rag_answer"] == committed["gold_answer"]).sum()
+print(f"\\nRAG committed to yes/no on {len(committed)} of {len(yn)} questions ({len(committed) / len(yn):.1%});")
+print(f"on those it picked the right one {right}/{len(committed)} times ({right / len(committed):.1%}).")
+""")
+
+code("""\
+other = yn[yn["rag_answer"] == "something else"]
+length = other["rag_pred"].str.len()
+committed_length = committed["rag_pred"].str.len()
+print(f"'Something else' answers: median {length.median():.0f} characters ({(length >= 60).sum()} of {len(other)} are 60+),")
+print(f"vs. a median of {committed_length.median():.0f} characters when RAG actually says yes or no.\\n")
+other.sort_values("rag_pred", key=lambda col: col.str.len())[["question", "gold", "rag_pred"]].iloc[[0, 1, 30, 31, -1]].style.set_properties(
+    subset=["rag_pred"], **{"white-space": "pre-wrap"}
+)
+""")
+
+md("""\
+When it says "yes" or "no" it is right 94.8% of the time (184/194) — but it
+does that on only 46% of the questions. The rest are "I don't know" (103)
+or "something else" (123). Those 123 answers have a median length of 98
+characters against 3 for a real yes/no: `flan-t5-base` mostly **copies or
+restates a sentence from the context instead of answering yes/no** —
+often one that affirms the question ("Canada's two official languages
+are English and French"), sometimes one that does not answer it at all
+("unopposed"). EM and F1 score all of these as wrong because the format
+is wrong, so the 41.2% mixes two things — wrong answers and right
+answers in the wrong shape — and I have not separated them. What it does
+show is that a small local model with a prompt tuned for refusal handles
+open questions far better than yes/no ones. A stronger backend
+(`get_llm("ollama")` or `"openai"`) or a prompt asking for "Yes or No"
+explicitly are the obvious next experiments.
+
+**Scope of these numbers.** One configuration (250/25 chunks, top-4), one
+generator (`flan-t5-base`), one run. They are measured on the dataset's
+gold strings, so they carry its quirks: yes/no skew, typos in gold answers,
+and exact-string matching that cannot credit a correct answer phrased
+differently.
+""")
+
+md("""\
+## 7. Takeaways
 
 - **Chunk size has a real, measurable effect on retrieval — up to a
   point.** 100-character chunks hit the right context 31.5% of the time
@@ -274,6 +410,11 @@ md("""\
   turns a retrieval failure into a visible non-answer instead of a
   silent hallucination — cheap to add, and demonstrated directly in
   section 5.
+- **Answer-level evaluation on all 918 Q&A gives a more sober picture than
+  retrieval alone**: 31.5% EM / 47.2% F1 on open questions (vs. 1.8% / 8.1%
+  without retrieval), but only 41.2% EM on yes/no questions, where a
+  trivial "always yes" scores 79.3%. A single overall EM (35.9%) would have
+  hidden both facts — it ties that same trivial baseline.
 - **The LLM backend is a swappable detail, not the core of the system**
   — `get_llm()` runs the exact same pipeline against a local
   Hugging Face model, a local Ollama/Mistral server, or the OpenAI API
